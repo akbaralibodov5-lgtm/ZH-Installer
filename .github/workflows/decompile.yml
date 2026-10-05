@@ -1,0 +1,89 @@
+name: Analyze and Decompile ZH Installer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ZH_Installer V1.9.exe"
+      - ".github/workflows/decompile.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify EXE
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "EXE not found: $exe" }
+          $item = Get-Item -LiteralPath $exe
+          Write-Host "EXE size: $($item.Length) bytes"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Install recovery tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstxtractor-ng decompyle3
+
+      - name: Extract PyInstaller archive
+        shell: pwsh
+        run: |
+          pyinstxtractor-ng "ZH_Installer V1.9.exe"
+          $dir = "ZH_Installer V1.9.exe_extracted"
+          if (-not (Test-Path -LiteralPath $dir)) {
+            throw "PyInstaller extraction directory was not created."
+          }
+          New-Item -ItemType Directory -Force -Path recovery | Out-Null
+          Move-Item -LiteralPath $dir -Destination recovery/extracted
+
+      - name: Decompile Python bytecode
+        shell: pwsh
+        run: |
+          $inputRoot = Join-Path $env:GITHUB_WORKSPACE "recovery/extracted"
+          $outputRoot = Join-Path $env:GITHUB_WORKSPACE "recovery/source"
+          New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+          $pycFiles = @(Get-ChildItem -LiteralPath $inputRoot -Recurse -File -Filter "*.pyc")
+          if ($pycFiles.Count -eq 0) { throw "No .pyc files found after extraction." }
+
+          $report = Join-Path $env:GITHUB_WORKSPACE "recovery/decompile-report.txt"
+          "Found $($pycFiles.Count) .pyc files" | Set-Content -LiteralPath $report
+          $success = 0
+          $failed = 0
+
+          foreach ($file in $pycFiles) {
+            $relative = $file.FullName.Substring($inputRoot.Length).TrimStart('','/')
+            $target = Join-Path $outputRoot ([IO.Path]::ChangeExtension($relative, ".py"))
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+
+            & decompyle3 $file.FullName 2>> $report | Set-Content -LiteralPath $target
+            if ($LASTEXITCODE -eq 0) {
+              $success++
+            } else {
+              $failed++
+              "FAILED: $relative" | Add-Content -LiteralPath $report
+            }
+          }
+
+          "Succeeded: $success" | Add-Content -LiteralPath $report
+          "Failed: $failed" | Add-Content -LiteralPath $report
+          if ($success -eq 0) { throw "No .pyc file was successfully decompiled." }
+
+      - name: Upload recovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zh-installer-recovery
+          path: recovery
+          if-no-files-found: error
+          retention-days: 14
