@@ -30,16 +30,16 @@ jobs:
           Write-Host "Input: $($item.FullName)"
           Write-Host ("Size: {0:N0} bytes" -f $item.Length)
 
-      - name: Set up Python
+      - name: Set up Python 3.8
         uses: actions/setup-python@v5
         with:
           python-version: "3.8"
-          cache: "pip"
+          cache: ""
 
       - name: Install recovery tools
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade "pip<26"
           python -m pip install pyinstxtractor-ng decompyle3
           pyinstxtractor-ng --help
           decompyle3 --help
@@ -53,8 +53,6 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path $recovery | Out-Null
 
-          # Use an explicit output directory when supported; otherwise use the
-          # extractor's normal <exe>_extracted directory and move it afterwards.
           Push-Location $env:GITHUB_WORKSPACE
           try {
             & pyinstxtractor-ng $exe
@@ -66,26 +64,35 @@ jobs:
             Pop-Location
           }
 
-          $candidates = @(
+          $source = @(
             (Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9.exe_extracted"),
+            (Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9_extracted"),
             (Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9_extracted")
-          )
-          $source = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
+          ) |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+            Select-Object -First 1
 
           if (-not $source) {
-            Write-Host "Extractor output:"
-            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force | Format-Table Name,Length,Mode
-            throw "Could not locate PyInstaller extraction directory."
+            Write-Host "Workspace contents:"
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force |
+              Select-Object Name,Length,Mode |
+              Format-Table -AutoSize
+            throw "Could not locate the PyInstaller extraction directory."
           }
 
           if (Test-Path -LiteralPath $extracted) {
             Remove-Item -LiteralPath $extracted -Recurse -Force
           }
+
           Move-Item -LiteralPath $source -Destination $extracted
 
-          Write-Host "Extraction completed: $extracted"
           $all = @(Get-ChildItem -LiteralPath $extracted -Recurse -File)
-          Write-Host "Extracted files: $($all.Count)"
+          Write-Host "Extraction completed."
+          Write-Host "Extracted file count: $($all.Count)"
+
+          if ($all.Count -eq 0) {
+            throw "PyInstaller extraction produced an empty directory."
+          }
 
       - name: Decompile recovered Python bytecode
         shell: pwsh
@@ -97,14 +104,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 
           $pycFiles = @(Get-ChildItem -LiteralPath $inputRoot -Recurse -File -Filter "*.pyc")
-          "PyInstaller recovery report" | Set-Content -LiteralPath $report
-          "PYC files found: $($pycFiles.Count)" | Add-Content -LiteralPath $report
+
+          "PyInstaller recovery report" | Set-Content -LiteralPath $report -Encoding UTF8
+          "PYC files found: $($pycFiles.Count)" | Add-Content -LiteralPath $report -Encoding UTF8
 
           if ($pycFiles.Count -eq 0) {
-            "No .pyc files were found. Listing extracted files:" | Add-Content -LiteralPath $report
+            "No .pyc files were found. Extracted file listing:" |
+              Add-Content -LiteralPath $report -Encoding UTF8
             Get-ChildItem -LiteralPath $inputRoot -Recurse -File |
-              Select-Object -ExpandProperty FullName |
-              Add-Content -LiteralPath $report
+              ForEach-Object {
+                $_.FullName.Substring($inputRoot.Length).TrimStart('','/')
+              } |
+              Add-Content -LiteralPath $report -Encoding UTF8
             throw "No .pyc files were found after extraction."
           }
 
@@ -117,25 +128,28 @@ jobs:
             $targetDir = Split-Path -Parent $target
             New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
-            & decompyle3 $file.FullName 2>> $report | Set-Content -LiteralPath $target
+            & decompyle3 $file.FullName 2>> $report |
+              Set-Content -LiteralPath $target -Encoding UTF8
 
             if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $target)) {
               $success++
-            }
-            else {
+            } else {
               $failed++
-              "FAILED: $relative" | Add-Content -LiteralPath $report
+              "FAILED: $relative" | Add-Content -LiteralPath $report -Encoding UTF8
             }
           }
 
-          "Succeeded: $success" | Add-Content -LiteralPath $report
-          "Failed: $failed" | Add-Content -LiteralPath $report
+          "Succeeded: $success" | Add-Content -LiteralPath $report -Encoding UTF8
+          "Failed: $failed" | Add-Content -LiteralPath $report -Encoding UTF8
+
+          Write-Host "Successful decompilations: $success"
+          Write-Host "Failed decompilations: $failed"
 
           if ($success -eq 0) {
             throw "No Python bytecode file could be decompiled."
           }
 
-      - name: Write manifest
+      - name: Write recovery manifest
         shell: pwsh
         run: |
           $root = Join-Path $env:GITHUB_WORKSPACE "recovery"
@@ -149,7 +163,8 @@ jobs:
               }
             })
 
-          $items | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $manifest -Encoding UTF8
+          $items | ConvertTo-Json -Depth 3 |
+            Set-Content -LiteralPath $manifest -Encoding UTF8
 
       - name: Upload recovery artifact
         uses: actions/upload-artifact@v4
