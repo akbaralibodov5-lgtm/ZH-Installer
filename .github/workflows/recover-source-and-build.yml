@@ -1,0 +1,136 @@
+name: Recover Source and Build EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ZH_Installer V1.9.exe"
+      - ".github/workflows/recover-source-and-build.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  recover-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.8
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+
+      - name: Install extraction tool
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade "pip<26"
+          python -m pip install --no-cache-dir "pyinstxtractor-ng==2025.1.6"
+
+      - name: Extract original bundle
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9.exe"
+          & pyinstxtractor-ng $exe
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller extraction failed." }
+
+          $source = Get-ChildItem $env:GITHUB_WORKSPACE -Directory -Force |
+            Where-Object { $_.Name -like "*_extracted" } |
+            Select-Object -First 1
+          if (-not $source) { throw "Extraction directory was not found." }
+
+          New-Item -ItemType Directory -Force -Path recovery | Out-Null
+          Move-Item $source.FullName recovery/extracted -Force
+
+      - name: Build pycdc
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/zrsx/pycdc.git pycdc
+          cmake -S pycdc -B pycdc-build -A x64
+          cmake --build pycdc-build --config Release --parallel 2
+
+          $candidate = Get-ChildItem pycdc-build -Recurse -Filter pycdc.exe -File |
+            Select-Object -First 1
+          if (-not $candidate) { throw "pycdc.exe was not produced." }
+          Copy-Item $candidate.FullName pycdc.exe -Force
+
+      - name: Recover editable application source
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE "recovery/extracted"
+          $src = Join-Path $env:GITHUB_WORKSPACE "src"
+          Remove-Item $src -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+
+          $targets = @(
+            @{ pyc="installer.pyc"; py="installer.py" },
+            @{ pyc="PYZ-00.pyz_extracted/mods.pyc"; py="mods.py" },
+            @{ pyc="PYZ-00.pyz_extracted/translations.pyc"; py="translations.py" }
+          )
+
+          foreach ($item in $targets) {
+            $input = Join-Path $root $item.pyc
+            $output = Join-Path $src $item.py
+            if (-not (Test-Path $input)) { throw "Missing $input" }
+
+            & "$env:GITHUB_WORKSPACE/pycdc.exe" $input 1> $output 2> "$output.err"
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content "$output.err" -ErrorAction SilentlyContinue
+              throw "pycdc failed for $($item.py)."
+            }
+            if ((Get-Item $output).Length -lt 100) { throw "Empty recovery: $($item.py)" }
+
+            python -m py_compile $output
+            Remove-Item "$output.err" -Force -ErrorAction SilentlyContinue
+          }
+
+          Copy-Item "$root/zh_installer.ico" "$src/zh_installer.ico" -Force
+
+      - name: Install application dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --no-cache-dir "pyinstaller==5.13.2"
+          python -m pip install --no-cache-dir requests beautifulsoup4 py7zr pycryptodome psutil texttable
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          Remove-Item build,dist -Recurse -Force -ErrorAction SilentlyContinue
+          pyinstaller --clean --noconfirm --onefile --noconsole --name "ZH_Installer-WARU" --icon "src/zh_installer.ico" --paths "src" --collect-all py7zr --collect-all psutil --collect-all bs4 "src/installer.py"
+
+          $out = Join-Path $env:GITHUB_WORKSPACE "dist/ZH_Installer-WARU.exe"
+          if (-not (Test-Path $out)) { throw "EXE was not produced." }
+
+          $bytes = [IO.File]::ReadAllBytes($out)
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Invalid PE executable." }
+          Write-Host ("Built EXE: {0:N0} bytes" -f (Get-Item $out).Length)
+
+      - name: Commit recovered source
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Add recovered editable source"
+            git push
+          }
+
+      - name: Upload source
+        uses: actions/upload-artifact@v4
+        with:
+          name: zh-installer-recovered-source
+          path: src
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: zh-installer-waru-exe
+          path: dist/ZH_Installer-WARU.exe
+          if-no-files-found: error
+          retention-days: 14
