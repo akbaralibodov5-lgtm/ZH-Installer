@@ -14,63 +14,115 @@ jobs:
   decompile:
     runs-on: windows-latest
     timeout-minutes: 30
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify EXE
+      - name: Verify original EXE
         shell: pwsh
         run: |
           $exe = Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9.exe"
-          if (-not (Test-Path -LiteralPath $exe)) { throw "EXE not found: $exe" }
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "Input EXE was not found: $exe"
+          }
           $item = Get-Item -LiteralPath $exe
-          Write-Host "EXE size: $($item.Length) bytes"
+          Write-Host "Input: $($item.FullName)"
+          Write-Host ("Size: {0:N0} bytes" -f $item.Length)
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.8"
+          cache: "pip"
 
       - name: Install recovery tools
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstxtractor-ng decompyle3
+          pyinstxtractor-ng --help
+          decompyle3 --help
 
       - name: Extract PyInstaller archive
         shell: pwsh
         run: |
-          pyinstxtractor-ng "ZH_Installer V1.9.exe"
-          $dir = "ZH_Installer V1.9.exe_extracted"
-          if (-not (Test-Path -LiteralPath $dir)) {
-            throw "PyInstaller extraction directory was not created."
-          }
-          New-Item -ItemType Directory -Force -Path recovery | Out-Null
-          Move-Item -LiteralPath $dir -Destination recovery/extracted
+          $exe = Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9.exe"
+          $recovery = Join-Path $env:GITHUB_WORKSPACE "recovery"
+          $extracted = Join-Path $recovery "extracted"
 
-      - name: Decompile Python bytecode
+          New-Item -ItemType Directory -Force -Path $recovery | Out-Null
+
+          # Use an explicit output directory when supported; otherwise use the
+          # extractor's normal <exe>_extracted directory and move it afterwards.
+          Push-Location $env:GITHUB_WORKSPACE
+          try {
+            & pyinstxtractor-ng $exe
+            if ($LASTEXITCODE -ne 0) {
+              throw "pyinstxtractor-ng failed with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9.exe_extracted"),
+            (Join-Path $env:GITHUB_WORKSPACE "ZH_Installer V1.9_extracted")
+          )
+          $source = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
+
+          if (-not $source) {
+            Write-Host "Extractor output:"
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force | Format-Table Name,Length,Mode
+            throw "Could not locate PyInstaller extraction directory."
+          }
+
+          if (Test-Path -LiteralPath $extracted) {
+            Remove-Item -LiteralPath $extracted -Recurse -Force
+          }
+          Move-Item -LiteralPath $source -Destination $extracted
+
+          Write-Host "Extraction completed: $extracted"
+          $all = @(Get-ChildItem -LiteralPath $extracted -Recurse -File)
+          Write-Host "Extracted files: $($all.Count)"
+
+      - name: Decompile recovered Python bytecode
         shell: pwsh
         run: |
           $inputRoot = Join-Path $env:GITHUB_WORKSPACE "recovery/extracted"
           $outputRoot = Join-Path $env:GITHUB_WORKSPACE "recovery/source"
-          New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
-          $pycFiles = @(Get-ChildItem -LiteralPath $inputRoot -Recurse -File -Filter "*.pyc")
-          if ($pycFiles.Count -eq 0) { throw "No .pyc files found after extraction." }
-
           $report = Join-Path $env:GITHUB_WORKSPACE "recovery/decompile-report.txt"
-          "Found $($pycFiles.Count) .pyc files" | Set-Content -LiteralPath $report
+
+          New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+
+          $pycFiles = @(Get-ChildItem -LiteralPath $inputRoot -Recurse -File -Filter "*.pyc")
+          "PyInstaller recovery report" | Set-Content -LiteralPath $report
+          "PYC files found: $($pycFiles.Count)" | Add-Content -LiteralPath $report
+
+          if ($pycFiles.Count -eq 0) {
+            "No .pyc files were found. Listing extracted files:" | Add-Content -LiteralPath $report
+            Get-ChildItem -LiteralPath $inputRoot -Recurse -File |
+              Select-Object -ExpandProperty FullName |
+              Add-Content -LiteralPath $report
+            throw "No .pyc files were found after extraction."
+          }
+
           $success = 0
           $failed = 0
 
           foreach ($file in $pycFiles) {
             $relative = $file.FullName.Substring($inputRoot.Length).TrimStart('','/')
             $target = Join-Path $outputRoot ([IO.Path]::ChangeExtension($relative, ".py"))
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+            $targetDir = Split-Path -Parent $target
+            New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
             & decompyle3 $file.FullName 2>> $report | Set-Content -LiteralPath $target
-            if ($LASTEXITCODE -eq 0) {
+
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $target)) {
               $success++
-            } else {
+            }
+            else {
               $failed++
               "FAILED: $relative" | Add-Content -LiteralPath $report
             }
@@ -78,7 +130,26 @@ jobs:
 
           "Succeeded: $success" | Add-Content -LiteralPath $report
           "Failed: $failed" | Add-Content -LiteralPath $report
-          if ($success -eq 0) { throw "No .pyc file was successfully decompiled." }
+
+          if ($success -eq 0) {
+            throw "No Python bytecode file could be decompiled."
+          }
+
+      - name: Write manifest
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE "recovery"
+          $manifest = Join-Path $root "manifest.json"
+
+          $items = @(Get-ChildItem -LiteralPath $root -Recurse -File |
+            ForEach-Object {
+              [PSCustomObject]@{
+                path = $_.FullName.Substring($root.Length).TrimStart('','/')
+                bytes = $_.Length
+              }
+            })
+
+          $items | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $manifest -Encoding UTF8
 
       - name: Upload recovery artifact
         uses: actions/upload-artifact@v4
